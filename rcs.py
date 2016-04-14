@@ -4,11 +4,11 @@ for RCS and this should eventually end up in separate modules or packages.
 """
 from __future__ import division, print_function, unicode_literals
 
-import json, pycouchdb, requests, jsonschema, regparse, db, config, os, sys, logging, numbers
+import json, pycouchdb, requests, jsonschema, regparse, db, config, os, sys, logging, numbers, flask
 
 from functools import wraps
 from logging.handlers import RotatingFileHandler
-from flask import Flask, Blueprint, Response, current_app, got_request_exception
+from flask import Flask, Blueprint, Response, current_app
 from flask.ext.restful import reqparse, request, abort, Api, Resource
 
 # FIXME clean this up
@@ -18,8 +18,9 @@ sys.setdefaultencoding('utf8')
 app.config.from_object(config)
 if os.environ.get('RCS_CONFIG'):
     app.config.from_envvar('RCS_CONFIG')
-handler = RotatingFileHandler( app.config['LOG_FILE'], maxBytes=app.config.get('LOG_ROTATE_BYTES',200000), backupCount=app.config.get('LOG_BACKUPS',5) )
-handler.setLevel( app.config['LOG_LEVEL'] )
+handler = RotatingFileHandler( app.config['LOG_FILE'],
+                               maxBytes=app.config.get('LOG_ROTATE_BYTES',200000),
+                               backupCount=app.config.get('LOG_BACKUPS',5) )
 handler.setFormatter( logging.Formatter(
     '%(asctime)s %(levelname)s: %(message)s '
     '[in %(pathname)s:%(lineno)d]'
@@ -27,7 +28,29 @@ handler.setFormatter( logging.Formatter(
 
 loggers = [app.logger, logging.getLogger('regparse.sigcheck')]
 for l in loggers:
+    l.setLevel( app.config['LOG_LEVEL'] )
     l.addHandler( handler )
+
+if 'ACCESS_LOG' in app.config:
+    acc_log = logging.getLogger('testlog')
+    acc_log.setLevel(logging.DEBUG)
+    acc_handler = RotatingFileHandler( app.config['ACCESS_LOG'],
+                                       maxBytes=app.config.get('LOG_ROTATE_BYTES',200000),
+                                       backupCount=app.config.get('LOG_BACKUPS',5) )
+    acc_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s '))
+    acc_log.addHandler(acc_handler)
+
+    def log_request(sender):
+        acc_log.info( '{ip} {method} {path} {agent}'.format( method = request.method,
+                                                             path = request.path,
+                                                             ip = request.remote_addr,
+                                                             agent = request.user_agent.string ) )
+        acc_log.debug(request.data)
+    flask.request_started.connect(log_request, app)
+
+    def log_response(sender, response):
+        acc_log.info( '{code} {text}'.format( code=response.status_code, text=response.status ) )
+    flask.request_finished.connect(log_response, app)
 
 
 db.init_auth_db( app.config['DB_CONN'], app.config['AUTH_DB'] )
@@ -60,7 +83,7 @@ Raw Agent: {agent}
             agent = request.user_agent.string,
         ), exc_info=exception
     )
-got_request_exception.connect(log_exception, app)
+flask.got_request_exception.connect(log_exception, app)
 
 def jsonp(func):
     """
@@ -169,12 +192,7 @@ class Register(Resource):
 
         data = dict( key=smallkey, request=s )
         try:
-            if s['payload_type'] == 'wms':
-                data['en'] = regparse.wms.make_node( s['en'], regparse.make_id(smallkey,'en'), app.config )
-                data['fr'] = regparse.wms.make_node( s['fr'], regparse.make_id(smallkey,'fr'), app.config )
-            else:
-                data['en'] = regparse.esri_feature.make_node( s['en'], regparse.make_id(smallkey,'en'), app.config )
-                data['fr'] = regparse.esri_feature.make_node( s['fr'], regparse.make_id(smallkey,'fr'), app.config )
+            data = regparse.make_record( smallkey, s, app.config )
         except regparse.metadata.MetadataException as mde:
             app.logger.warning( 'Metadata could not be retrieved for layer', exc_info=mde )
             abort( 400, msg=mde.message )
@@ -227,6 +245,57 @@ class Update(Resource):
             return '{"error":"argument should be either \'all\' or a positive integer"}',400
         return Response( json.dumps( regparse.refresh_records( day_limit, app.config ) ),  mimetype='application/json' )
 
+class UpdateFeature(Resource):
+    """
+    Handles updates to an ESRI feature entry
+    """
+
+    @regparse.sigcheck.validate
+    def put(self, smallkey):
+        """
+        A REST endpoint for updating details in a feature layer.
+
+        :param smallkey: A unique identifier for the dataset (can be any unique string, but preferably should be short)
+        :type smallkey: str
+        :returns: JSON Response -- 200 on success; 400 with JSON payload of an errors array on failure
+        """
+        try:
+            payload = json.loads( request.data )
+        except Exception:
+            return '{"errors":["Unparsable json"]}',400
+
+        fragment = {'en':{}, 'fr':{}}
+        if len(payload) == 2 and 'en' in payload and 'fr' in payload:
+            fragment = payload
+        else:
+            fragment['en'].update(payload)
+            fragment['fr'].update(payload)
+
+        dbdata = db.get_raw( smallkey )
+        
+        if dbdata is None:
+            return '{"errors":["Record not found in database"]}',404
+        elif dbdata['type'] != 'feature':
+            return '{"errors":["Record is not a feature layer"]}',400
+
+        dbdata['data']['request']['en'].update( fragment['en'] )
+        dbdata['data']['request']['fr'].update( fragment['fr'] )
+
+        if not validator.is_valid( dbdata['data']['request'] ):
+            resp = { 'errors': [x.message for x in validator.iter_errors(dbdata['data']['request'])] }
+            app.logger.info( resp )
+            return Response(json.dumps(resp),  mimetype='application/json', status=400)
+
+        try:
+            data = regparse.make_record( smallkey, dbdata['data']['request'], app.config )
+        except regparse.metadata.MetadataException as mde:
+            app.logger.warning( 'Metadata could not be retrieved for layer', exc_info=mde )
+            abort( 400, msg=mde.message )
+
+        db.put_doc( smallkey, { 'type':data['request']['payload_type'], 'data':data } )
+        
+        return smallkey, 200
+
 class Simplification(Resource):
     """
     Handles updates to simplification factor of a feature layer
@@ -270,8 +339,8 @@ class Simplification(Resource):
             dbdata['data']['fr']['maxAllowableOffset'] = intFactor
             
             #also store factor in the request, so we can preserve the factor during an update
-            dbdata['data']['request']['en']['maxAllowableOffset'] = intFactor
-            dbdata['data']['request']['fr']['maxAllowableOffset'] = intFactor
+            dbdata['data']['request']['en']['max_allowable_offset'] = intFactor
+            dbdata['data']['request']['fr']['max_allowable_offset'] = intFactor
         
         #put back in the database
         db.put_doc( smallkey, { 'type':dbdata['type'], 'data':dbdata['data'] } )
@@ -295,10 +364,10 @@ api_1.add_resource(DocsV1, '/docs/<string:lang>/<string:smallkeylist>')
 api_1.add_resource(Register, '/register/<string:smallkey>')
 api_1.add_resource(Update, '/update/<string:arg>')
 api_1.add_resource(Simplification, '/simplification/<string:smallkey>')
+api_1.add_resource(UpdateFeature, '/updatefeature/<string:smallkey>')
 app.register_blueprint(api_1_bp, url_prefix=global_prefix+'/v1')
 
 if __name__ == '__main__':
     for l in loggers:
-        l.setLevel(0)
         l.info( 'logger started' )
     app.run(debug=True)
